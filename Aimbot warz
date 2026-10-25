@@ -1,0 +1,475 @@
+-- ======================================================================
+-- P7D HUB v4.4 - Ultimate WarZ Fixed (Sharp Aimbot, Stable ESP & Distance)
+-- ======================================================================
+
+local CoreGui = game:GetService("CoreGui")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Camera = workspace.CurrentCamera
+local player = LocalPlayer
+
+local function getSafeGuiContainer()
+    if gethui then
+        local ok, h = pcall(gethui)
+        if ok and typeof(h) == "Instance" then return h end
+    end
+    local ok = pcall(function()
+        local t = Instance.new("Folder"); t.Parent = CoreGui; t:Destroy()
+    end)
+    if ok then return CoreGui end
+    return LocalPlayer:WaitForChild("PlayerGui", 10)
+end
+local GuiParent = getSafeGuiContainer()
+
+-- ===== เคลียร์ระบบเก่าทั้งหมดก่อนรันใหม่ =====
+if _G.P7DHubCleanup then pcall(_G.P7DHubCleanup) end
+_G.P7DHubConns = {}
+_G.P7DRunId = _G.P7DRunId or 0 -- รันครั้งแรกต้องมีค่าเริ่มต้น ไม่งั้นลูปที่เช็ก runId จะไม่ทำงานเลย
+local runId = _G.P7DRunId
+local function bind(signal, fn)
+    local c = signal:Connect(fn)
+    table.insert(_G.P7DHubConns, c)
+    return c
+end
+
+_G.P7DHubCleanup = function()
+    _G.P7DRunId = (_G.P7DRunId or 0) + 1
+    for _, c in ipairs(_G.P7DHubConns or {}) do pcall(function() c:Disconnect() end) end
+    _G.P7DHubConns = {}
+    pcall(function() RunService:UnbindFromRenderStep("P7DHubRender") end)
+    pcall(function() RunService:UnbindFromRenderStep("P7DAimbotLock") end)
+    for _, n in ipairs({"P7DHubUI", "P7DHubFloatingBtn"}) do
+        pcall(function() local g = GuiParent:FindFirstChild(n); if g then g:Destroy() end end)
+    end
+    if _G.P7DEspCleanup then pcall(_G.P7DEspCleanup) end
+end
+
+bind(RunService.RenderStepped, function()
+    Camera = workspace.CurrentCamera or Camera
+end)
+
+-- ======================================================================
+-- CONFIG SETTINGS
+-- ======================================================================
+local Settings = {
+    AimbotEnabled = false,
+    ShowFOV = true,
+    FOVRadius = 100,
+    MaxDistance = 1000,
+    TeamCheck = true,
+    NoRecoil = false,
+    
+    BoxESP = false,
+    BoxColor = Color3.fromRGB(255, 0, 0),
+    NameESP = false,
+    HPESP = false,
+    SkeletonESP = false,
+    ShowLocalPlayer = false,
+    
+    AutoHealEnabled = false,
+    ItemName = "BandagesDX",
+    HealThreshold = 0.74,
+}
+
+-- ======================================================================
+-- 1. HELPER FUNCTIONS (Character & Team Check ต้นฉบับ)
+-- ======================================================================
+local function getCharacter(targetPlayer)
+    if not targetPlayer then return nil end
+    if targetPlayer.Character and targetPlayer.Character:FindFirstChildOfClass("Humanoid") then
+        return targetPlayer.Character
+    end
+    local charByName = workspace:FindFirstChild(targetPlayer.Name)
+    if charByName and charByName:FindFirstChildOfClass("Humanoid") then
+        return charByName
+    end
+    for _, folderName in ipairs({"Characters", "Players", "Entities"}) do
+        local folder = workspace:FindFirstChild(folderName)
+        if folder then
+            local c = folder:FindFirstChild(targetPlayer.Name)
+            if c and c:FindFirstChildOfClass("Humanoid") then
+                return c
+            end
+        end
+    end
+    return nil
+end
+
+local function isSameTeamRaw(targetPlayer)
+    if not Settings.TeamCheck then return false end
+    if not targetPlayer or targetPlayer == player then return true end
+
+    if player.Team ~= nil and targetPlayer.Team ~= nil then
+        if player.Team == targetPlayer.Team then
+            local teamName = tostring(player.Team.Name):lower()
+            if not string.find(teamName, "neutral") and not string.find(teamName, "ffa") and not string.find(teamName, "free") then
+                return true
+            end
+        end
+    end
+
+    if player.TeamColor and targetPlayer.TeamColor and player.TeamColor == targetPlayer.TeamColor then
+        local colorName = tostring(player.TeamColor.Name):lower()
+        if not string.find(colorName, "white") and not string.find(colorName, "grey") and not string.find(colorName, "gray") then
+            return true
+        end
+    end
+
+    local myTeamVal = player:FindFirstChild("Team") or (player:FindFirstChild("leaderstats") and player.leaderstats:FindFirstChild("Team"))
+    local targetTeamVal = targetPlayer:FindFirstChild("Team") or (targetPlayer:FindFirstChild("leaderstats") and targetPlayer.leaderstats:FindFirstChild("Team"))
+    if myTeamVal and targetTeamVal and myTeamVal.Value == targetTeamVal.Value and tostring(myTeamVal.Value) ~= "" and tostring(myTeamVal.Value) ~= "0" then
+        return true
+    end
+
+    local myChar = player.Character
+    local targetChar = targetPlayer.Character
+    if myChar and targetChar then
+        local myCharTeam = myChar:FindFirstChild("Team") or myChar:FindFirstChild("TeamColor")
+        local targetCharTeam = targetChar:FindFirstChild("Team") or targetChar:FindFirstChild("TeamColor")
+        if myCharTeam and targetCharTeam and myCharTeam.Value == targetCharTeam.Value then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function isSameTeam(targetPlayer)
+    local ok, res = pcall(isSameTeamRaw, targetPlayer)
+    if ok then return res end
+    return false
+end
+
+-- เช็ก "มี HP จริง" : เลือด > 0, ไม่อยู่ในสถานะตาย/ล้ม, หลอด HP ไม่ว่างเปล่า
+-- ใช้ร่วมกันทั้ง Aimbot (ใกล้/ไกล), Box ESP, Tracer และ Highlight
+local MIN_VALID_HP = 1 -- เลือดต่ำกว่านี้ถือว่า "ไม่มี HP" (กันค่าเศษ เช่น 0.01)
+local function hasHP(hum)
+    if not hum or not hum.Parent then return false end
+    local hp, maxHp = hum.Health, hum.MaxHealth
+    if hp ~= hp or maxHp ~= maxHp then return false end -- NaN
+    if maxHp <= 0 or hp < MIN_VALID_HP then return false end
+    if hp / maxHp <= 0.005 then return false end        -- หลอด HP แทบว่าง
+    local okS, st = pcall(function() return hum:GetState() end)
+    if okS and (st == Enum.HumanoidStateType.Dead) then return false end
+    return true
+end
+
+-- ======================================================================
+-- 2. AUTO HEAL SYSTEM
+-- ======================================================================
+local remoteCache = nil
+local function getUseItemRemote()
+    if remoteCache and remoteCache.Parent then return remoteCache end
+    remoteCache = nil
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    local r = remotes and remotes:FindFirstChild("UseItem")
+    if not r then
+        for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+            if d.Name == "UseItem" and (d:IsA("RemoteEvent") or d:IsA("RemoteFunction")) then
+                r = d
+                break
+            end
+        end
+    end
+    remoteCache = r
+    return r
+end
+
+local lastHealTime = 0
+task.spawn(function()
+    while _G.P7DRunId == runId do
+        if Settings.AutoHealEnabled then
+            local char = LocalPlayer.Character
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 and (hum.Health / hum.MaxHealth) <= Settings.HealThreshold then
+                if (os.clock() - lastHealTime) >= 0.5 then
+                    lastHealTime = os.clock()
+                    local remote = getUseItemRemote()
+                    if remote then
+                        pcall(function()
+                            if remote:IsA("RemoteFunction") then
+                                remote:InvokeServer(3, Settings.ItemName, nil, nil, true)
+                            else
+                                remote:FireServer(3, Settings.ItemName, nil, nil, true)
+                            end
+                        end)
+                    end
+                end
+            end
+        end
+        task.wait(0.3)
+    end
+end)
+
+-- ======================================================================
+-- 3. AIMBOT LOCK & FOV
+-- ======================================================================
+local fovDrawing = Drawing.new("Circle")
+fovDrawing.Visible = false
+fovDrawing.Transparency = 0.8
+fovDrawing.Color = Color3.fromRGB(255, 60, 60)
+fovDrawing.Thickness = 1.5
+fovDrawing.NumSides = 64
+
+bind(RunService.RenderStepped, function()
+    local viewportSize = Camera.ViewportSize
+    fovDrawing.Position = Vector2.new(viewportSize.X / 2, viewportSize.Y / 2)
+    fovDrawing.Radius = Settings.FOVRadius
+    fovDrawing.Visible = Settings.AimbotEnabled and Settings.ShowFOV
+end)
+
+bind(RunService.RenderStepped, function()
+    if not Settings.NoRecoil then return end
+    local char = LocalPlayer.Character
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    if not tool then return end
+    pcall(function()
+        for _, v in pairs(tool:GetDescendants()) do
+            if v:IsA("NumberValue") or v:IsA("IntValue") then
+                local n = v.Name:lower()
+                if n:find("recoil") or n:find("spread") or n:find("shake") then
+                    v.Value = 0
+                end
+            end
+        end
+    end)
+end)
+
+-- ===== AIMBOT LOCK : ย้ายลอจิก + ระบบเบื้องหลังทั้งหมดจาก WarZPvP_OPEN_BETA.txt =====
+-- Target Locking & Closest Player Finder
+-- ล็อคเป้าเฉพาะเป้าที่อยู่ด้านหน้า + มองเห็นตัวละครจริงเท่านั้น
+-- ไม่ล็อคผ่านกำแพง/สิ่งกีดขวาง และไม่ล็อคเป้าหมายที่อยู่นอกระยะ
+-- ล็อคเฉพาะตอน "กดยิง/ใช้" เท่านั้น นอกนั้นไม่ล็อค
+local snapLock -- กำหนดค่าทีหลัง: หันไปล็อคทันทีเมื่อกดเล็ง/ยิง
+-- กฎ: ล็อคเป้า "เฉพาะ" ตอนกดยิง/ใช้อาวุธเท่านั้น ปุ่มอื่นทั้งหมด (รวมเล็ง/ซูม) ไม่มีผล
+local mouseShoot, mouseAim = false, false       -- เมาส์ (นับเฉพาะคลิกที่ไม่ได้โดน UI)
+local padShoot, padAim = false, false           -- จอย R2 / L2
+local activeTouches = {}                        -- [input] = "aim" | "shoot" เฉพาะนิ้วที่กดปุ่มเล็ง/ยิงจริง
+local activeTool = nil                          -- อาวุธ Tool ที่กำลังถูกใช้ (Activated)
+local touchOnlyDevice = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled and not UserInputService.MouseEnabled
+
+-- มือถือ: นิ้วต้องแตะ "ปุ่ม" (GuiButton) ที่ชื่อเป็นปุ่มเล็ง/ยิงโดยตรง (เช็กแค่ปุ่มนั้นกับพ่อของมัน)
+local AIM_WORDS = {"aim", "scope", "zoom", "sight"}
+local SHOOT_WORDS = {"fire", "shoot", "attack", "trigger"}
+local function nameHas(n, words)
+    n = string.lower(n)
+    for _, w in ipairs(words) do
+        if string.find(n, w, 1, true) then return true end
+    end
+    return false
+end
+local function classifyName(n)
+    if nameHas(n, AIM_WORDS) or string.lower(n) == "ads" or string.find(string.lower(n), "^ads[_%s]") then return "aim" end
+    if nameHas(n, SHOOT_WORDS) then return "shoot" end
+    return nil
+end
+-- ปุ่ม "ยิง / ใช้" ของเกม (WarzMobileControls.TouchHud.Fire / FireLeft)
+-- ไม่ใช้การเดาตำแหน่งนิ้วแล้ว (เสี่ยงคลาดเคลื่อนจนกระโดดไปโดนปุ่มยิง)
+-- แต่ผูกเหตุการณ์กับตัวปุ่มยิงโดยตรง: ต้องกดโดนปุ่มยิงจริงเท่านั้นถึงจะล็อค
+local FIRE_BUTTON_NAMES = { "Fire", "FireLeft" }
+local hookedFireBtns = {}
+local function hookFireButton(btn)
+    if hookedFireBtns[btn] then return end
+    hookedFireBtns[btn] = true
+    print("[P7D Aimbot] hook ปุ่มยิง: " .. btn:GetFullName())
+    bind(btn.InputBegan, function(input)
+        local t = input.UserInputType
+        if t == Enum.UserInputType.Touch or t == Enum.UserInputType.MouseButton1 then
+            activeTouches[input] = "shoot"
+            if snapLock then pcall(snapLock) end
+        end
+    end)
+end
+task.spawn(function()
+    while _G.P7DRunId == runId do
+        pcall(function()
+            local pg = player:FindFirstChildOfClass("PlayerGui")
+            local mc = pg and pg:FindFirstChild("WarzMobileControls")
+            local hud = mc and mc:FindFirstChild("TouchHud")
+            if hud then
+                for _, n in ipairs(FIRE_BUTTON_NAMES) do
+                    local b = hud:FindFirstChild(n)
+                    if b and b:IsA("GuiButton") then hookFireButton(b) end
+                end
+            end
+        end)
+        task.wait(0.5) -- HUD ถูกสร้าง/สร้างใหม่ตอนเข้าเกม จึงสแกนซ้ำเรื่อย ๆ
+    end
+end)
+
+bind(UserInputService.InputBegan, function(input, gpe)
+    local t = input.UserInputType
+    if t == Enum.UserInputType.MouseButton1 then
+        if not gpe then mouseShoot = true end
+    elseif t == Enum.UserInputType.MouseButton2 then
+        if not gpe then mouseAim = true end
+    elseif input.KeyCode == Enum.KeyCode.ButtonR2 then padShoot = true
+    elseif input.KeyCode == Enum.KeyCode.ButtonL2 then padAim = true
+    end
+    if snapLock then pcall(snapLock) end -- หันไปล็อคทันทีที่กด
+end)
+
+bind(UserInputService.InputEnded, function(input)
+    local t = input.UserInputType
+    if t == Enum.UserInputType.MouseButton1 then mouseShoot = false
+    elseif t == Enum.UserInputType.MouseButton2 then mouseAim = false
+    elseif input.KeyCode == Enum.KeyCode.ButtonR2 then padShoot = false
+    elseif input.KeyCode == Enum.KeyCode.ButtonL2 then padAim = false
+    end
+    activeTouches[input] = nil -- ปล่อยนิ้ว = เลิกล็อคทันที
+end)
+
+-- อาวุธแบบ Tool: Activated = กำลังใช้/ยิง, Deactivated = ปล่อย
+local hookedTools = {}
+local function hookTool(tool)
+    if not tool:IsA("Tool") or hookedTools[tool] then return end
+    hookedTools[tool] = true
+    bind(tool.Activated, function()
+        activeTool = tool
+        if snapLock then pcall(snapLock) end
+    end)
+    bind(tool.Deactivated, function() if activeTool == tool then activeTool = nil end end)
+    bind(tool.Unequipped, function() if activeTool == tool then activeTool = nil end end)
+end
+local function hookCharacter(char)
+    if not char then return end
+    for _, c in ipairs(char:GetChildren()) do hookTool(c) end
+    bind(char.ChildAdded, hookTool)
+end
+hookCharacter(player.Character)
+bind(player.CharacterAdded, function(char) activeTool = nil; hookCharacter(char) end)
+
+local function touchHas(kind)
+    for inp, k in pairs(activeTouches) do
+        if inp.UserInputState == Enum.UserInputState.End or inp.UserInputState == Enum.UserInputState.Cancel then
+            activeTouches[inp] = nil -- กันค้าง
+        elseif k == kind then
+            return true
+        end
+    end
+    return false
+end
+
+-- true = กำลังเล็ง/ซูม (คลิกขวา / L2 / ปุ่มเล็งบนมือถือ)
+local function isAimInputActive()
+    if mouseAim then
+        local ok, down = pcall(function() return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) end)
+        if ok and not down then mouseAim = false end -- กันค้าง
+    end
+    if padAim then
+        local ok, down = pcall(function() return UserInputService:IsGamepadButtonDown(Enum.UserInputType.Gamepad1, Enum.KeyCode.ButtonL2) end)
+        if ok and not down then padAim = false end
+    end
+    return mouseAim or padAim or touchHas("aim")
+end
+
+-- true = กำลังยิง/ใช้ (คลิกซ้าย / R2 / ปุ่มยิงบนมือถือ / Tool Activated)
+local function isShootInputActive()
+    if mouseShoot then
+        local ok, down = pcall(function() return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) end)
+        if ok and not down then mouseShoot = false end
+    end
+    if padShoot then
+        local ok, down = pcall(function() return UserInputService:IsGamepadButtonDown(Enum.UserInputType.Gamepad1, Enum.KeyCode.ButtonR2) end)
+        if ok and not down then padShoot = false end
+    end
+    if activeTool and activeTool.Parent ~= player.Character then activeTool = nil end
+    -- มือถือล้วน: มีแค่ปุ่ม ยิง/ใช้ (Fire / FireLeft) ที่ทำให้ล็อค ปุ่มอื่น/แตะจอ/ลากกล้อง/กระโดดไม่มีผล
+    if touchOnlyDevice then return touchHas("shoot") end
+    return mouseShoot or padShoot or activeTool ~= nil or touchHas("shoot")
+end
+
+-- ล็อคเฉพาะตอน "ยิง/ใช้" เท่านั้น (เล็ง/ซูมอย่างเดียวไม่ล็อค)
+local function isLockInputActive()
+    return isShootInputActive()
+end
+
+local AIM_PARTS = {"UpperTorso", "Torso", "HumanoidRootPart"} -- ล็อคเฉพาะลำตัว (ไม่ล็อคหัว)
+local sharedRayParams = RaycastParams.new()
+sharedRayParams.FilterType = Enum.RaycastFilterType.Exclude
+sharedRayParams.IgnoreWater = true
+local sharedRayChar = nil
+
+local function isTargetVisible(char, targetParts)
+    local Camera = workspace.CurrentCamera
+    if not Camera or not char then return false, nil end
+    local myChar = player.Character
+    if sharedRayChar ~= myChar then
+        sharedRayChar = myChar
+        sharedRayParams.FilterDescendantsInstances = {myChar}
+    end
+    local rayParams = sharedRayParams
+    for _, partName in ipairs(targetParts) do
+        local part = char:FindFirstChild(partName)
+        if part and part:IsA("BasePart") then
+            local screenPos, onScreen = Camera:WorldToViewportPoint(part.Position)
+            if onScreen and screenPos.Z > 0 then
+                local origin = Camera.CFrame.Position
+                local hit = workspace:Raycast(origin, part.Position - origin, rayParams)
+                if not hit or hit.Instance:IsDescendantOf(char) then
+                    return true, part
+                end
+            end
+        end
+    end
+    return false, nil
+end
+
+local function getClosestPlayerToCenter()
+    local Camera = workspace.CurrentCamera
+    if not Camera then return nil end
+    local localChar = player.Character
+    local localRoot = localChar and localChar:FindFirstChild("HumanoidRootPart")
+    if not localRoot then return nil end
+    local closestPlayer, closestScore, closestPart = nil, math.huge, nil
+    local centerPos = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    local aiming = false -- ไม่ใช้โหมดเล็งทั้งจอแล้ว: ล็อคเฉพาะเป้าที่อยู่ตรงหน้า (ในวง FOV) และมองเห็นจริง
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player then
+            if isSameTeam(p) then continue end
+            local char = getCharacter(p)
+            local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            if humanoid and hasHP(humanoid) and root then
+                local worldDistance = (root.Position - localRoot.Position).Magnitude
+                if worldDistance <= Settings.MaxDistance then
+                    local visible, visiblePart = isTargetVisible(char, AIM_PARTS)
+                    if visible and visiblePart then
+                        local direction = visiblePart.Position - Camera.CFrame.Position
+                        if direction.Magnitude > 0.001 then
+                            local dot = math.clamp(Camera.CFrame.LookVector:Dot(direction.Unit), -1, 1)
+                            local screenPos, onScreen = Camera:WorldToViewportPoint(visiblePart.Position)
+                            if onScreen and screenPos.Z > 0 then
+                                local screenDistance = (Vector2.new(screenPos.X, screenPos.Y) - centerPos).Magnitude
+                                local validTarget, score = false, math.huge
+                                if aiming then
+                                    if dot > 0 then validTarget, score = true, math.deg(math.acos(dot)) end
+                                else
+                                    if dot > 0 and screenDistance <= Settings.FOVRadius then validTarget, score = true, screenDistance end
+                                end
+                                if validTarget and score < closestScore then
+                                    closestScore, closestPlayer, closestPart = score, p, visiblePart
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return closestPlayer, closestPart
+end
+
+local lockedTarget = nil
+local lastAimDebug = 0
+local aimErrWarned = false
+pcall(function() RunService:UnbindFromRenderStep("P7DAimbotLock") end)
+snapLock = function()
+    local Camera = workspace.CurrentCamera
+    if not Camera then return end
+ 
